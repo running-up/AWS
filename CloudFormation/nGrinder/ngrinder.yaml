@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template showing how to create nGrinder controller and agents on AWS.
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  ControllerInstanceType:
+    Description: Controller InstanceType EC2 instance type
+    Type: String
+    Default: "t3.xlarge"
+    ConstraintDescription: must be a valid EC2 instance type.
+  AgentInstanceType:
+    Description: Agent InstanceType EC2 instance type
+    Type: String
+    Default: "t3.xlarge"
+    ConstraintDescription: must be a valid EC2 instance type
+  AgentInstanceCount:
+    Description: Number of the agent instances
+    Type: Number
+    Default: "1"
+    MinValue: "1"
+    MaxValue: "10"
+    ConstraintDescription: 1 <= AgentInstanceCount <= 10
+  VPCCidr:
+    Description: CIDR block for new VPC
+    Type: String
+    Default: "10.0.0.0/16"
+  SubnetCidr:
+    Description: CIDR block for new Subnet
+    Type: String
+    Default: "10.0.0.0/24"
+  ImageID:
+    Description: AMI ID
+    Type: String
+    Default: "ami-0f66bf23ed74d9284"
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      Tags:
+        - Key: Name
+          Value: ngrinder_vpc
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref SubnetCidr
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ngrinder_subnet
+
+  igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ngrinder_igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref igw
+
+  routeTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ngrinder_routetable
+
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref routeTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref igw
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref routeTable
+      SubnetId: !Ref Subnet
+
+  networkACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ngrinder_acl
+
+  inboundPortsNetworkACLEntry:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkACL
+      RuleAction: allow
+      RuleNumber: 100
+      Protocol: 6
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 0
+        To: 65535        
+
+  outboundPortsNetworkACLEntry:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkACL
+      RuleAction: allow
+      RuleNumber: 100
+      Protocol: 6   
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 0
+        To: 65535
+
+  subnetNetworkACLAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref networkACL
+      SubnetId: !Ref Subnet
+
+  controllerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Controller SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 16001
+          ToPort: 16001
+          SourceSecurityGroupId: !GetAtt agentSG.GroupId
+        - IpProtocol: tcp
+          FromPort: 12000
+          ToPort: 13000
+          SourceSecurityGroupId: !GetAtt agentSG.GroupId
+      Tags:
+        - Key: Name
+          Value: ngrinder_controllerSG
+
+  agentSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Agent SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ngrinder_agentSG
+
+  agentLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          install_run: [install, run]
+        install:
+          packages:
+            yum:
+              docker: []
+          services:
+            sysvinit:
+              docker:
+                enabled: 'true'
+                ensureRunning: 'true'
+        run:
+          commands:
+            agentRun:
+              command: !Sub |
+                docker pull ngrinder/agent:3.5.3
+                docker run -d -v ~/ngrinder-agent:/opt/ngrinder-agent -d ngrinder/agent:3.5.3 ${controllerInstance.PrivateIp}:8080 &
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId: !Ref ImageID
+      InstanceType: !Ref AgentInstanceType
+      SecurityGroups: 
+        - !Ref agentSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource agentLaunchConfig --configsets install_run --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource agentASG --region ${AWS::Region}  
+
+  agentASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: !Ref AgentInstanceCount
+    Properties:
+      VPCZoneIdentifier: 
+        - !Ref Subnet
+      LaunchConfigurationName: !Ref agentLaunchConfig
+      MinSize: !Ref AgentInstanceCount
+      MaxSize: !Ref AgentInstanceCount
+
+  controllerInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          install_run: [install, run]
+        install:
+          packages:
+            yum:
+              docker: []
+          services:
+            sysvinit:
+              docker:
+                enabled: 'true'
+                ensureRunning: 'true'
+        run:
+          commands:
+            controllerRun:
+              command: !Sub |
+                docker pull ngrinder/controller:3.5.3
+                docker run -d -v ~/ngrinder-controller:/opt/ngrinder-controller -p 8080:80 -p 16001:16001 -p 12000-13000:12000-13000 ngrinder/controller:3.5.3 &
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId: !Ref ImageID
+      InstanceType: !Ref AgentInstanceType
+      NetworkInterfaces:
+        -
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref Subnet
+          DeviceIndex: '0'
+          GroupSet:
+            - !GetAtt controllerSG.GroupId
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource controllerInstance --configsets install_run --region ${AWS::Region}
+Outputs:
+  controllerURL:
+    Description: nGrinder URL
+    Value: !Join [ "", ['http://', !GetAtt controllerInstance.PublicIp, ':8080']]
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicIp"
+      
+      

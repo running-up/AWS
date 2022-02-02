@@ -1,0 +1,18 @@
+# This is an appspec.yml template file for use with an EC2/On-Premises deployment in CodeDeploy.
+# The lines in this template starting with the hashtag symbol are 
+#   instructional comments and can be safely left in the file or 
+#   ignored.
+# For help completing this file, see the "AppSpec File Reference" in the  
+#   "CodeDeploy User Guide" at
+#   https://docs.aws.amazon.com/codedeploy/latest/userguide/app-spec-ref.html
+version: 0.0
+os: linux 
+files:
+  - source: asg-0.0.1-SNAPSHOT.jar
+    destination: /home/ec2-user
+file_exists_behavior: OVERWRITE
+hooks:
+  ApplicationStop:
+    - location: scripts/kill.sh
+  ApplicationStart:
+    - location: scripts/start.sh

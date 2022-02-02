@@ -13,7 +13,7 @@ Parameters:
   AgentInstanceType:
     Description: Agent InstanceType EC2 instance type
     Type: String
-    Default: "t3.xlarge"
+    Default: "c5.xlarge"
     ConstraintDescription: must be a valid EC2 instance type
   AgentInstanceCount:
     Description: Number of the agent instances

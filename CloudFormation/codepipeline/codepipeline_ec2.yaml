@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for codepinpeline
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - 
+        Label:
+          default: Codepinpeline Template
+        Parameters:
+          - VPC
+          - Subnets
+          - KeyPairName
+          - ImageID
+          - ApplicationInstanceType
+          - ApplicationInstanceMinCount
+          - ApplicationInstanceMaxCount
+          - ApplicationInstanceDesiredCount
+    ParameterLabels:
+      VPC:
+        default: VPC
+      Subnets:
+        default: subnets      
+      KeyPairName:
+        default: Name of an existing Amazon EC2 key pair to enable SSH or RDP access to the instances.
+      ImageID:
+        default: AMI ID
+      ApplicationInstanceType:
+        default: Application InstanceType EC2 instance type
+      ApplicationInstanceMinCount:
+        default: Number of the minimum application instances
+      ApplicationInstanceMaxCount:
+        default: Number of the maximum application instances
+      ApplicationInstanceDesiredCount:
+        default: Number of the desired application instances   
+
+Parameters:
+  VPC:
+    Description: VPC ID
+    Type: AWS::EC2::VPC::Id
+  Subnets:
+    Description: Subnet IDs
+    Type: List<AWS::EC2::Subnet::Id>
+  KeyPairName:
+    Description: Name of an existing Amazon EC2 key pair to enable SSH or RDP access to the instances.
+    Type: AWS::EC2::KeyPair::KeyName
+    MinLength: '1'
+    MaxLength: '255'
+    AllowedPattern: "[\\x20-\\x7E]*"
+  ImageID:
+    Description: AMI ID
+    Type: String
+    Default: "ami-0f66bf23ed74d9284"
+  ApplicationInstanceType:
+    Description: Application InstanceType EC2 instance type
+    Type: String
+    Default: "c5.xlarge"
+  ApplicationInstanceMinCount:
+    Description: Number of the minimum application instances
+    Type: Number
+    Default: "1"
+    MinValue: "1"
+    MaxValue: "10"
+    ConstraintDescription: 1 <= ApplicationInstanceMinCount <= 10
+  ApplicationInstanceMaxCount:
+    Description: Number of the maximum application instances
+    Type: Number
+    Default: "1"
+    MinValue: "1"
+    MaxValue: "10"
+    ConstraintDescription: 1 <= ApplicationInstanceMaxCount <= 10
+  ApplicationInstanceDesiredCount:
+    Description: Number of the desired application instances
+    Type: Number
+    Default: "1"
+    MinValue: "1"
+    MaxValue: "10"
+    ConstraintDescription: 1 <= ApplicationInstanceDesiredCount <= 10
+
+Resources:
+  applicationSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref LoadBalancerSG
+      Tags:
+        - Key: Name
+          Value: applicationSG
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess    
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  InstanceProfile: 
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: "/"
+      Roles: 
+        - !Ref InstanceRole
+
+  applicationLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          install_run: [install, run]
+        install:
+          packages:
+            yum:
+              ruby: []
+        run:
+          commands:
+            agentRun:
+              command: !Sub |
+                amazon-linux-extras install -y java-openjdk11
+                wget https://aws-codedeploy-ap-northeast-2.s3.ap-northeast-2.amazonaws.com/latest/install
+                chmod +x ./install
+                ./install auto
+    Properties:
+      KeyName: !Ref KeyPairName
+      ImageId: !Ref ImageID
+      InstanceType: !Ref ApplicationInstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups: 
+        - !Ref applicationSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource applicationLaunchConfig --configsets install_run --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource applicationASG --region ${AWS::Region}  
+
+  LoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LoadBalancer SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: LoadBalancerSG
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Subnets: !Ref Subnets
+      CrossZone: true
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '8080'
+          Protocol: HTTP
+      HealthCheck:
+        Target: HTTP:8080/
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+      SecurityGroups:
+        - !Ref LoadBalancerSG    
+
+  applicationASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: !Ref ApplicationInstanceDesiredCount
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchConfigurationName: !Ref applicationLaunchConfig
+      DesiredCapacity: !Ref ApplicationInstanceDesiredCount
+      MinSize: !Ref ApplicationInstanceMinCount
+      MaxSize: !Ref ApplicationInstanceMaxCount
+      LoadBalancerNames: 
+        - !Ref LoadBalancer
+
+  CodeDeployApplication: 
+    Type: AWS::CodeDeploy::Application 
+    Properties:
+      ApplicationName:
+        'Fn::Sub': '${AWS::StackName}-CodeDeploy'
+      ComputePlatform: Server
+
+  CodeDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole      
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  DeploymentGroup: 
+    Type: AWS::CodeDeploy::DeploymentGroup 
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication        
+      AutoScalingGroups: 
+        - !Ref applicationASG 
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce           
+      ServiceRoleArn: !GetAtt CodeDeploymentRole.Arn
+
+Outputs:
+  applicationSG:
+    Description: application sg ID
+    Value: !Ref applicationSG
+    Export:
+      Name: !Sub "${AWS::StackName}-applicationSG"
+  LoadBalancerDNS:
+    Description: Loadbalander DNS
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-LoadBalancerDNS"
